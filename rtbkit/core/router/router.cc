@@ -117,7 +117,8 @@ Router(ServiceBase & parent,
        Amount maxBidAmount,
        int secondsUntilSlowMode,
        Amount slowModeAuthorizedMoneyLimit,
-       Seconds augmentationWindow)
+       Seconds augmentationWindow,
+       int numAugmentationLoops)
     : ServiceBase(serviceName, parent),
       shutdown_(false),
       postAuctionEndpoint(*this),
@@ -155,9 +156,13 @@ Router(ServiceBase & parent,
       monitorProviderClient(getZmqContext()),
       maxBidAmount(maxBidAmount),
       slowModeTolerance(MonitorClient::DefaultTolerance),
-      augmentationWindow(augmentationWindow)
+      augmentationWindow(augmentationWindow),
+      numAugmentationLoops(numAugmentationLoops)
 {
     monitorProviderClient.addProvider(this);
+
+    for (int i = 0; i < numAugmentationLoops; i++)
+        augmentationLoops.push_back(std::shared_ptr<AugmentationLoop>(new AugmentationLoop(*this, "AugmentationLoop" + std::to_string(i))));
 }
 
 Router::
@@ -171,7 +176,8 @@ Router(std::shared_ptr<ServiceProxies> services,
        Amount maxBidAmount,
        int secondsUntilSlowMode,
        Amount slowModeAuthorizedMoneyLimit,
-       Seconds augmentationWindow)
+       Seconds augmentationWindow,
+       int numAugmentationLoops)
     : ServiceBase(serviceName, services),
       shutdown_(false),
       postAuctionEndpoint(*this),
@@ -209,10 +215,14 @@ Router(std::shared_ptr<ServiceProxies> services,
       monitorProviderClient(getZmqContext()),
       maxBidAmount(maxBidAmount),
       slowModeTolerance(MonitorClient::DefaultTolerance),
-      augmentationWindow(augmentationWindow)
+      augmentationWindow(augmentationWindow),
+      numAugmentationLoops(numAugmentationLoops)
 
 {
     monitorProviderClient.addProvider(this);
+
+    for (int i = 0; i < numAugmentationLoops; i++)
+        augmentationLoops.push_back(std::shared_ptr<AugmentationLoop>(new AugmentationLoop(*this, "AugmentationLoop" + std::to_string(i))));
 }
 
 void
@@ -293,7 +303,9 @@ init()
         initBidderInterface(json);
     }
 
-    augmentationLoop.init();
+    // initialize each augmentation loop
+    for (std::shared_ptr<AugmentationLoop> &augmentationLoop : augmentationLoops)
+        augmentationLoop->init();
 
     logger.init(getServices()->config, serviceName() + "/logger");
 
@@ -327,7 +339,10 @@ init()
     monitorProviderClient.init(getServices()->config);
 
     loopMonitor.init();
-    loopMonitor.addMessageLoop("augmentationLoop", &augmentationLoop);
+
+    for(int i = 0 ; i < augmentationLoops.size() ; i++)
+        loopMonitor.addMessageLoop("augmentationLoop" + std::to_string(i), &*augmentationLoops.at(i));
+
     loopMonitor.addMessageLoop("logger", &logger);
     loopMonitor.addMessageLoop("configListener", &configListener);
     loopMonitor.addMessageLoop("monitorClient", &monitorClient);
@@ -453,7 +468,10 @@ start(boost::function<void ()> onStop)
     bidder->start();
     logger.start();
     analytics.start();
-    augmentationLoop.start();
+
+    for (const std::shared_ptr<AugmentationLoop> &augmentationLoop : augmentationLoops)
+        augmentationLoop->start();
+
     runThread.reset(new boost::thread(runfn));
 
     if (connectPostAuctionLoop) {
@@ -493,11 +511,13 @@ size_t
 Router::
 numNonIdle() const
 {
-    size_t numInFlight, numAwaitingAugmentation;
+    size_t numInFlight, numAwaitingAugmentation = 0;
     {
         Guard guard(lock);
         numInFlight = inFlight.size();
-        numAwaitingAugmentation = augmentationLoop.numAugmenting();
+
+        for (const std::shared_ptr<AugmentationLoop> &augmentationLoop : augmentationLoops)
+            numAwaitingAugmentation += augmentationLoop->numAugmenting();
     }
 
     cerr << "numInFlight = " << numInFlight << endl;
@@ -511,7 +531,10 @@ Router::
 sleepUntilIdle()
 {
     for (int iter = 0;;++iter) {
-        augmentationLoop.sleepUntilIdle();
+
+        for (const std::shared_ptr<AugmentationLoop> &augmentationLoop : augmentationLoops)
+            augmentationLoop->sleepUntilIdle();
+
         size_t nonIdle = numNonIdle();
         if (nonIdle == 0) break;
         //cerr << "there are " << nonIdle << " non-idle" << endl;
@@ -758,7 +781,12 @@ run()
                        Date::fromSecondsSinceEpoch(last_check).print(),
                        format("active: %zd augmenting, %zd inFlight, "
                               "%zd agents",
-                              augmentationLoop.numAugmenting(),
+                              [&]()->int{
+                                    size_t numAugmentations = 0;
+                                    for (const std::shared_ptr<AugmentationLoop> &augmentationLoop : augmentationLoops)
+                                        numAugmentations += augmentationLoop->numAugmenting();
+                                    return numAugmentations;
+                              }(),
                               inFlight.size(),
                               agents.size()));
 
@@ -830,7 +858,8 @@ shutdown()
     futex_wake(shutdown_);
     wakeupMainLoop.signal();
 
-    augmentationLoop.shutdown();
+    for (const std::shared_ptr<AugmentationLoop> &augmentationLoop : augmentationLoops)
+        augmentationLoop->shutdown();
 
     if (runThread)
         runThread->join();
@@ -1344,7 +1373,12 @@ doStats(const std::vector<std::string> & message)
 {
     Json::Value result(Json::objectValue);
 
-    result["numAugmenting"] = augmentationLoop.numAugmenting();
+    result["numAugmenting"] = [&]()->int{
+                                    size_t numAugmentations = 0;
+                                    for (const std::shared_ptr<AugmentationLoop> &augmentationLoop : augmentationLoops)
+                                        numAugmentations += augmentationLoop->numAugmenting();
+                                    return numAugmentations;
+                              }();
     result["numInFlight"] = inFlight.size();
     result["blacklistUsers"] = blacklist.size();
 
@@ -1417,8 +1451,8 @@ augmentAuction(const std::shared_ptr<AugmentationInfo> & info)
             wakeupMainLoop.signal();
         };
 
-    augmentationLoop.augment(info, Date::now().plusSeconds(augmentationWindow.count()),
-                             onDoneAugmenting);
+    augmentationLoops.at(numAuctions % augmentationLoops.size())->augment(
+                info, Date::now().plusSeconds(augmentationWindow.count()), onDoneAugmenting);
 }
 
 std::shared_ptr<AugmentationInfo>
@@ -2119,7 +2153,7 @@ doBidImpl(const BidMessage &message, const std::vector<std::string> &originalMes
                 // Here we're garanteed that price.value >= slowModeAuthorizedMoneyLimit
                 accumulatedBidMoneyInThisPeriod = price.value;
 
-                recordHit("monitor.systemInSlowMode"); 
+                recordHit("monitor.systemInSlowMode");
             }
 
             else {
@@ -2152,7 +2186,7 @@ doBidImpl(const BidMessage &message, const std::vector<std::string> &originalMes
             recordHit("accounts.%s.NOBUDGET", config.account.toString('.'));
             continue;
         }
-        
+
         recordCount(bid.price.value, "cummulatedBidPrice");
         recordCount(price.value, "cummulatedAuthorizedPrice");
 
