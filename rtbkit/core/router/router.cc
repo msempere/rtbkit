@@ -1451,7 +1451,7 @@ augmentAuction(const std::shared_ptr<AugmentationInfo> & info)
             wakeupMainLoop.signal();
         };
 
-    augmentationLoops.at(numAuctions % augmentationLoops.size())->augment(
+    augmentationLoops[numAuctions % augmentationLoops.size()]->augment(
                 info, Date::now().plusSeconds(augmentationWindow.count()), onDoneAugmenting);
 }
 
